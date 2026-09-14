@@ -1,24 +1,49 @@
-name: ves
-description: "VES Vehicle Safety and Vision System"
-publish_to: 'none'
-version: 1.0.0+1
+name: Build VES APK
 
-environment:
-  sdk: '>=3.3.0 <4.0.0'
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
-dependencies:
-  flutter:
-    sdk: flutter
-  camera: ^0.10.5+9
-  flutter_tts: ^4.2.0
-  geolocator: ^11.0.0
-  sensors_plus: ^7.1.0
-  permission_handler: ^11.3.1
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^3.0.0
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
-flutter:
-  uses-material-design: true
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Set up Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        channel: 'stable'
+
+    - name: Create Android Structure
+      run: flutter create . --platforms=android --org com.ves
+
+    - name: Enforce Android SDK 34
+      run: |
+        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 34/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 34/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk = flutter.targetSdkVersion/targetSdk = 34/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk flutter.targetSdkVersion/targetSdk 34/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/minSdk flutter.minSdkVersion/minSdk 21/g' {} +
+
+    - name: Get Dependencies
+      run: flutter pub get
+
+    - name: Build Release APK
+      run: flutter build apk --release
+
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ves-release-apk
+        path: build/app/outputs/flutter-apk/app-release.apk
