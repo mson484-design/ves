@@ -6,13 +6,8 @@ import 'package:geolocator/geolocator.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-List<CameraDescription> _cameras = [];
-
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  try {
-    _cameras = await availableCameras();
-  } catch (_) {}
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
     home: VesScreen(),
@@ -48,24 +43,49 @@ class _VesScreenState extends State<VesScreen> {
   }
 
   Future<void> _initAll() async {
+    // 1. 권한 요청
     await [Permission.camera, Permission.location].request();
 
+    // 2. TTS 설정
     try {
       await _tts.setLanguage("ko-KR");
       await _tts.setSpeechRate(0.5);
     } catch (_) {}
 
-    if (_cameras.isNotEmpty) {
-      _cam = CameraController(_cameras[0], ResolutionPreset.medium, enableAudio: false);
-      try {
+    // 3. 카메라 탐색 및 연결
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isNotEmpty) {
+        // 후면 카메라 우선 선택
+        final backCamera = cameras.firstWhere(
+          (c) => c.lensDirection == CameraLensDirection.back,
+          orElse: () => cameras.first,
+        );
+
+        _cam = CameraController(
+          backCamera,
+          ResolutionPreset.high,
+          enableAudio: false,
+        );
+
         await _cam!.initialize();
-        if (mounted) setState(() => _ready = true);
-      } catch (_) {}
+        if (mounted) {
+          setState(() {
+            _ready = true;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint("카메라 초기화 실패: $e");
     }
 
+    // 4. GPS 속도 측정
     try {
       _posSub = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 1),
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 1,
+        ),
       ).listen((pos) {
         if (mounted) {
           setState(() {
@@ -75,15 +95,14 @@ class _VesScreenState extends State<VesScreen> {
       });
     } catch (_) {}
 
+    // 5. 충격/급감속 감지 (5초 쿨타임, 잔진동 필터링)
     _sensorSub = accelerometerEventStream().listen((e) {
       final now = DateTime.now();
       if (now.difference(_lastCheck).inMilliseconds < 300) return;
       _lastCheck = now;
 
-      // 5초 쿨타임 (반복 멘트 방지)
       if (now.difference(_lastAlertTime).inSeconds < 5) return;
 
-      // 차량 주행 충격 감도 (8.5로 잔진동 차단)
       if (e.x.abs() > 8.5 || e.y.abs() > 8.5 || (e.z.abs() - 9.8).abs() > 8.5) {
         _lastAlertTime = now;
 
@@ -125,12 +144,24 @@ class _VesScreenState extends State<VesScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
+          // 카메라 프리뷰 (화면 전체 채움)
           if (_ready && _cam != null && _cam!.value.isInitialized)
-            Center(child: CameraPreview(_cam!))
+            SizedBox.expand(
+              child: FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  width: _cam!.value.previewSize?.height ?? 1,
+                  height: _cam!.value.previewSize?.width ?? 1,
+                  child: CameraPreview(_cam!),
+                ),
+              ),
+            )
           else
             const Center(
               child: CircularProgressIndicator(color: Colors.greenAccent),
             ),
+
+          // 상단 와이드 HUD 바
           SafeArea(
             child: Align(
               alignment: Alignment.topCenter,
@@ -152,7 +183,11 @@ class _VesScreenState extends State<VesScreen> {
                         const SizedBox(width: 8),
                         Text(
                           _status,
-                          style: TextStyle(color: _color, fontSize: 19, fontWeight: FontWeight.bold),
+                          style: TextStyle(
+                            color: _color,
+                            fontSize: 19,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ],
                     ),
@@ -160,12 +195,20 @@ class _VesScreenState extends State<VesScreen> {
                       children: [
                         Text(
                           _speed.toStringAsFixed(1),
-                          style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                         const SizedBox(width: 4),
                         const Text(
                           'km/h',
-                          style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.bold),
+                          style: TextStyle(
+                            color: Colors.white70,
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ],
                     ),
