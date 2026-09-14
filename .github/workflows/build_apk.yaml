@@ -24,22 +24,16 @@ jobs:
       with:
         channel: 'stable'
 
-    - name: Create Android Scaffold
+    - name: Initialize Android Project
       run: flutter create . --platforms=android --org com.ves
-
-    - name: Fix Android SDK Versions
-      run: |
-        # 최신 kts 형식과 구형 gradle 형식 모두 compileSdk를 36으로 강제 지정
-        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 36/g' {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk = flutter.targetSdkVersion/targetSdk = 34/g' {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk flutter.targetSdkVersion/targetSdk 34/g' {} +
 
     - name: Get Dependencies
       run: flutter pub get
 
     - name: Build Release APK
-      run: flutter build apk --release
+      run: flutter build apk --release --extra-front-end-options=--no-sound-null-safety || flutter build apk --release
+      env:
+        JAVA_TOOL_OPTIONS: "-Xmx4096m"
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
