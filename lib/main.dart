@@ -147,7 +147,7 @@ class _VesScreenState extends State<VesScreen> {
                       ],
                     ),
                     Row(
-                      crossAxisAlignment: CrossAlignment.baseline,
+                      crossAxisAlignment: CrossAxisAlignment.baseline,
                       textBaseline: TextBaseline.alphabetic,
                       children: [
                         Text(
