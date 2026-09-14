@@ -37,6 +37,8 @@ class _VesScreenState extends State<VesScreen> {
   Timer? _timer;
   StreamSubscription<Position>? _posSub;
   StreamSubscription<AccelerometerEvent>? _sensorSub;
+  
+  DateTime _lastAlertTime = DateTime.now().subtract(const Duration(seconds: 10)); // 마지막 경보 시각
   DateTime _lastCheck = DateTime.now();
 
   @override
@@ -50,6 +52,7 @@ class _VesScreenState extends State<VesScreen> {
 
     try {
       await _tts.setLanguage("ko-KR");
+      await _tts.setSpeechRate(0.5);
     } catch (_) {}
 
     if (_cameras.isNotEmpty) {
@@ -77,12 +80,19 @@ class _VesScreenState extends State<VesScreen> {
       if (now.difference(_lastCheck).inMilliseconds < 300) return;
       _lastCheck = now;
 
-      if (e.x.abs() > 6.0 || e.y.abs() > 6.0 || (e.z.abs() - 9.8).abs() > 6.0) {
+      // 쿨타임 검사: 최근 경보 발생 후 5초 이내면 무조건 무시 (반복 멘트 원천 차단)
+      if (now.difference(_lastAlertTime).inSeconds < 5) return;
+
+      // 차량 주행 충격 감도 (기존 6.0 -> 8.5로 묵직하게 올려 잔진동 오작동 방지)
+      if (e.x.abs() > 8.5 || e.y.abs() > 8.5 || (e.z.abs() - 9.8).abs() > 8.5) {
+        _lastAlertTime = now; // 경보 시각 갱신
+
         if (!mounted) return;
         setState(() {
           _status = "급감속/충격 주의!";
           _color = Colors.redAccent;
         });
+
         _tts.speak("주의하세요");
 
         _timer?.cancel();
@@ -147,7 +157,7 @@ class _VesScreenState extends State<VesScreen> {
                       ],
                     ),
                     Row(
-                      crossAxisAlignment: CrossAxisAlignment.baseline,
+                      crossAxisAlignment: CrossAlignment.baseline,
                       textBaseline: TextBaseline.alphabetic,
                       children: [
                         Text(
