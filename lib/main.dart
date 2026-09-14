@@ -37,8 +37,8 @@ class _VesScreenState extends State<VesScreen> {
   Timer? _timer;
   StreamSubscription<Position>? _posSub;
   StreamSubscription<AccelerometerEvent>? _sensorSub;
-  
-  DateTime _lastAlertTime = DateTime.now().subtract(const Duration(seconds: 10)); // 마지막 경보 시각
+
+  DateTime _lastAlertTime = DateTime.now().subtract(const Duration(seconds: 10));
   DateTime _lastCheck = DateTime.now();
 
   @override
@@ -80,12 +80,12 @@ class _VesScreenState extends State<VesScreen> {
       if (now.difference(_lastCheck).inMilliseconds < 300) return;
       _lastCheck = now;
 
-      // 쿨타임 검사: 최근 경보 발생 후 5초 이내면 무조건 무시 (반복 멘트 원천 차단)
+      // 5초 쿨타임 (반복 멘트 방지)
       if (now.difference(_lastAlertTime).inSeconds < 5) return;
 
-      // 차량 주행 충격 감도 (기존 6.0 -> 8.5로 묵직하게 올려 잔진동 오작동 방지)
+      // 차량 주행 충격 감도 (8.5로 잔진동 차단)
       if (e.x.abs() > 8.5 || e.y.abs() > 8.5 || (e.z.abs() - 9.8).abs() > 8.5) {
-        _lastAlertTime = now; // 경보 시각 갱신
+        _lastAlertTime = now;
 
         if (!mounted) return;
         setState(() {
@@ -157,15 +157,16 @@ class _VesScreenState extends State<VesScreen> {
                       ],
                     ),
                     Row(
-                      crossAxisAlignment: CrossAlignment.baseline,
-                      textBaseline: TextBaseline.alphabetic,
                       children: [
                         Text(
                           _speed.toStringAsFixed(1),
-                          style: const TextStyle(color: Colors.white, fontSize: 30, fontWeight: FontWeight.w900),
+                          style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
                         ),
                         const SizedBox(width: 4),
-                        const Text('km/h', style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.bold)),
+                        const Text(
+                          'km/h',
+                          style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.bold),
+                        ),
                       ],
                     ),
                   ],
