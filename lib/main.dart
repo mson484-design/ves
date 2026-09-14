@@ -25,7 +25,7 @@ class _VesScreenState extends State<VesScreen> {
   CameraController? _cam;
   final FlutterTts _tts = FlutterTts();
   double _speed = 0.0;
-  String _status = "안전 운행 중";
+  String _status = "정상 안전 운행 중";
   Color _color = Colors.greenAccent;
   bool _ready = false;
 
@@ -43,16 +43,13 @@ class _VesScreenState extends State<VesScreen> {
   }
 
   Future<void> _initAll() async {
-    // 1. 필수 권한
     await [Permission.camera, Permission.location].request();
 
-    // 2. TTS 음성
     try {
       await _tts.setLanguage("ko-KR");
       await _tts.setSpeechRate(0.5);
     } catch (_) {}
 
-    // 3. 후면 카메라 연결
     try {
       final cameras = await availableCameras();
       if (cameras.isNotEmpty) {
@@ -72,7 +69,6 @@ class _VesScreenState extends State<VesScreen> {
       debugPrint("카메라 오류: $e");
     }
 
-    // 4. GPS 속도
     try {
       _posSub = Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
@@ -88,23 +84,20 @@ class _VesScreenState extends State<VesScreen> {
       });
     } catch (_) {}
 
-    // 5. 중력이 제외된 '순수 충격/감속 센서' (userAccelerometer)
-    // 폰 기울기 때문에 생기는 거짓 경보 무한 반복 원천 차단
+    // 중력 제외 순수 가속도 센서 (반복 알림 및 거짓 경보 원천 차단)
     _sensorSub = userAccelerometerEventStream().listen((e) {
       final now = DateTime.now();
       if (now.difference(_lastCheck).inMilliseconds < 300) return;
       _lastCheck = now;
 
-      // 경고 울린 후 8초간은 무조건 침묵 (반복 멘트 차단)
       if (now.difference(_lastAlertTime).inSeconds < 8) return;
 
-      // 실제 급감속/충격 (가만히 있거나 기울여도 0에 가까움, 쿵 부딪혀야 12 이상 감지)
       if (e.x.abs() > 12.0 || e.y.abs() > 12.0 || e.z.abs() > 12.0) {
         _lastAlertTime = now;
 
         if (!mounted) return;
         setState(() {
-          _status = "급감속/충격 주의!";
+          _status = "급감속 / 충격 주의!";
           _color = Colors.redAccent;
         });
 
@@ -114,7 +107,7 @@ class _VesScreenState extends State<VesScreen> {
         _timer = Timer(const Duration(seconds: 4), () {
           if (mounted) {
             setState(() {
-              _status = "안전 운행 중";
+              _status = "정상 안전 운행 중";
               _color = Colors.greenAccent;
             });
           }
@@ -140,7 +133,7 @@ class _VesScreenState extends State<VesScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 카메라 프리뷰 (화면 전체 꽉 채움)
+          // 1. 실시간 전방 카메라 (화면 전체 꽉 채움)
           if (_ready && _cam != null && _cam!.value.isInitialized)
             SizedBox.expand(
               child: FittedBox(
@@ -157,56 +150,83 @@ class _VesScreenState extends State<VesScreen> {
               child: CircularProgressIndicator(color: Colors.greenAccent),
             ),
 
-          // 상단 와이드 직사각형 HUD
+          // 2. 상단: 군더더기 없는 미니멀 속도계 (HUD 스타일)
           SafeArea(
             child: Align(
-              alignment: Alignment.topCenter,
+              alignment: Alignment.topRight,
               child: Container(
-                width: double.infinity,
-                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                margin: const EdgeInsets.only(top: 10, right: 14),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
                 decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.75),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: _color, width: 2),
+                  color: Colors.black.withOpacity(0.65),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white24, width: 1.5),
                 ),
                 child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAlignment.baseline,
+                  textBaseline: TextBaseline.alphabetic,
                   children: [
-                    Row(
-                      children: [
-                        Icon(Icons.shield, color: _color, size: 24),
-                        const SizedBox(width: 8),
-                        Text(
-                          _status,
-                          style: TextStyle(
-                            color: _color,
-                            fontSize: 19,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
+                    Text(
+                      _speed.toStringAsFixed(1),
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 26,
+                        fontWeight: FontWeight.w900,
+                      ),
                     ),
-                    Row(
-                      children: [
-                        Text(
-                          _speed.toStringAsFixed(1),
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 28,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(width: 4),
-                        const Text(
-                          'km/h',
-                          style: TextStyle(
-                            color: Colors.white70,
-                            fontSize: 13,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
+                    const SizedBox(width: 4),
+                    const Text(
+                      'km/h',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          // 3. 하단: 관제 문구 전용 와이드 바 (아래 배치)
+          SafeArea(
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: Container(
+                width: double.infinity,
+                margin: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.78),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: _color, width: 2.2),
+                  boxShadow: [
+                    BoxShadow(
+                      color: _color.withOpacity(0.25),
+                      blurRadius: 8,
+                      spreadRadius: 1,
+                    )
+                  ],
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      _color == Colors.greenAccent ? Icons.verified_user : Icons.warning_amber_rounded,
+                      color: _color,
+                      size: 24,
+                    ),
+                    const SizedBox(width: 10),
+                    Text(
+                      _status,
+                      style: TextStyle(
+                        color: _color,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.5,
+                      ),
                     ),
                   ],
                 ),
