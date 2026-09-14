@@ -24,16 +24,25 @@ jobs:
       with:
         channel: 'stable'
 
-    - name: Get Dependencies
-      run: flutter pub get
-
     - name: Create Android Scaffold
       run: flutter create . --platforms=android --org com.ves
 
-    - name: Fix Compile SDK Version to 34
+    - name: Fix Android SDK Versions
       run: |
-        sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 34/g' android/app/build.gradle || true
-        sed -i 's/targetSdk flutter.targetSdkVersion/targetSdk 34/g' android/app/build.gradle || true
+        # 최신 kts 형식과 구형 gradle 형식 모두 compileSdk를 36으로 강제 지정
+        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 36/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk = flutter.targetSdkVersion/targetSdk = 34/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk flutter.targetSdkVersion/targetSdk 34/g' {} +
+
+    - name: Get Dependencies
+      run: flutter pub get
 
     - name: Build Release APK
       run: flutter build apk --release
+
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ves-release-apk
+        path: build/app/outputs/flutter-apk/app-release.apk
