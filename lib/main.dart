@@ -21,35 +21,43 @@ class VesScreen extends StatefulWidget {
   State<VesScreen> createState() => _VesScreenState();
 }
 
-class _VesScreenState extends State<VesScreen> {
+class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
   CameraController? _cam;
   final FlutterTts _tts = FlutterTts();
   double _speed = 0.0;
   String _status = "정상 안전 운행 중";
   Color _color = Colors.greenAccent;
   bool _ready = false;
+  bool _isSpeaking = false;
 
   Timer? _timer;
   StreamSubscription<Position>? _posSub;
   StreamSubscription<UserAccelerometerEvent>? _sensorSub;
 
+  DateTime _lastSpeedUpdate = DateTime.now();
   DateTime _lastAlertTime = DateTime.now().subtract(const Duration(seconds: 20));
-  DateTime _lastCheck = DateTime.now();
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initAll();
   }
 
   Future<void> _initAll() async {
+    // 1. 권한 요청
     await [Permission.camera, Permission.location].request();
 
+    // 2. TTS 안전 초기화
     try {
       await _tts.setLanguage("ko-KR");
       await _tts.setSpeechRate(0.5);
+      _tts.setCompletionHandler(() {
+        _isSpeaking = false;
+      });
     } catch (_) {}
 
+    // 3. 카메라 초기화 (안정적인 해상도 설정)
     try {
       final cameras = await availableCameras();
       if (cameras.isNotEmpty) {
@@ -59,7 +67,7 @@ class _VesScreenState extends State<VesScreen> {
         );
         _cam = CameraController(
           backCamera,
-          ResolutionPreset.high,
+          ResolutionPreset.medium, // 고해상도로 인한 발열/멈춤 방지
           enableAudio: false,
         );
         await _cam!.initialize();
@@ -69,6 +77,7 @@ class _VesScreenState extends State<VesScreen> {
       debugPrint("카메라 오류: $e");
     }
 
+    // 4. GPS 속도 (0.5초당 1회만 화면 갱신하여 렉 방지)
     try {
       _posSub = Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
@@ -76,23 +85,24 @@ class _VesScreenState extends State<VesScreen> {
           distanceFilter: 1,
         ),
       ).listen((pos) {
-        if (mounted) {
-          setState(() {
-            _speed = (pos.speed > 0 ? pos.speed : 0.0) * 3.6;
-          });
+        final now = DateTime.now();
+        if (now.difference(_lastSpeedUpdate).inMilliseconds > 500) {
+          _lastSpeedUpdate = now;
+          if (mounted) {
+            setState(() {
+              _speed = (pos.speed > 0 ? pos.speed : 0.0) * 3.6;
+            });
+          }
         }
       });
     } catch (_) {}
 
-    // 중력 제외 순수 가속도 센서 (반복 알림 및 거짓 경보 원천 차단)
+    // 5. 충격/급감속 센서 (순수 거동 감지 + 8초 쿨타임)
     _sensorSub = userAccelerometerEventStream().listen((e) {
       final now = DateTime.now();
-      if (now.difference(_lastCheck).inMilliseconds < 300) return;
-      _lastCheck = now;
-
       if (now.difference(_lastAlertTime).inSeconds < 8) return;
 
-      if (e.x.abs() > 12.0 || e.y.abs() > 12.0 || e.z.abs() > 12.0) {
+      if (e.x.abs() > 11.0 || e.y.abs() > 11.0 || e.z.abs() > 11.0) {
         _lastAlertTime = now;
 
         if (!mounted) return;
@@ -101,7 +111,10 @@ class _VesScreenState extends State<VesScreen> {
           _color = Colors.redAccent;
         });
 
-        _tts.speak("주의하세요");
+        if (!_isSpeaking) {
+          _isSpeaking = true;
+          _tts.speak("주의하세요");
+        }
 
         _timer?.cancel();
         _timer = Timer(const Duration(seconds: 4), () {
@@ -117,7 +130,19 @@ class _VesScreenState extends State<VesScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 앱이 화면에서 벗어났다가 다시 올 때 카메라 멈춤 방지
+    if (_cam == null || !_cam!.value.isInitialized) return;
+    if (state == AppLifecycleState.inactive) {
+      _cam?.dispose();
+    } else if (state == AppLifecycleState.resumed) {
+      _initAll();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
     _posSub?.cancel();
     _sensorSub?.cancel();
@@ -133,7 +158,7 @@ class _VesScreenState extends State<VesScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 1. 실시간 전방 카메라 (화면 전체 꽉 채움)
+          // 1. 전방 카메라 화면 (부드러운 프리뷰)
           if (_ready && _cam != null && _cam!.value.isInitialized)
             SizedBox.expand(
               child: FittedBox(
@@ -150,7 +175,7 @@ class _VesScreenState extends State<VesScreen> {
               child: CircularProgressIndicator(color: Colors.greenAccent),
             ),
 
-          // 2. 상단: 군더더기 없는 미니멀 속도계 (HUD 스타일)
+          // 2. 상단 우측: 미니멀 속도계
           SafeArea(
             child: Align(
               alignment: Alignment.topRight,
@@ -164,15 +189,13 @@ class _VesScreenState extends State<VesScreen> {
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAlignment.baseline,
-                  textBaseline: TextBaseline.alphabetic,
                   children: [
                     Text(
                       _speed.toStringAsFixed(1),
                       style: const TextStyle(
                         color: Colors.white,
                         fontSize: 26,
-                        fontWeight: FontWeight.w900,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
                     const SizedBox(width: 4),
@@ -190,31 +213,24 @@ class _VesScreenState extends State<VesScreen> {
             ),
           ),
 
-          // 3. 하단: 관제 문구 전용 와이드 바 (아래 배치)
+          // 3. 하단 중앙: 안전 관제 문구 바 (아래 배치)
           SafeArea(
             child: Align(
               alignment: Alignment.bottomCenter,
               child: Container(
                 width: double.infinity,
-                margin: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                margin: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                 decoration: BoxDecoration(
                   color: Colors.black.withOpacity(0.78),
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: _color, width: 2.2),
-                  boxShadow: [
-                    BoxShadow(
-                      color: _color.withOpacity(0.25),
-                      blurRadius: 8,
-                      spreadRadius: 1,
-                    )
-                  ],
+                  border: Border.all(color: _color, width: 2),
                 ),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(
-                      _color == Colors.greenAccent ? Icons.verified_user : Icons.warning_amber_rounded,
+                      _color == Colors.greenAccent ? Icons.shield : Icons.warning_rounded,
                       color: _color,
                       size: 24,
                     ),
@@ -225,7 +241,6 @@ class _VesScreenState extends State<VesScreen> {
                         color: _color,
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
-                        letterSpacing: 0.5,
                       ),
                     ),
                   ],
