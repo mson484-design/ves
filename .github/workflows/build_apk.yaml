@@ -27,10 +27,11 @@ jobs:
     - name: Create Android Structure
       run: flutter create . --platforms=android --org com.ves
 
-    - name: Enforce Android SDK 34
+    - name: Enforce Android SDK 36
       run: |
-        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 34/g' {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 34/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 36/g' {} +
+        find android/app/ -name "compileSdk 34/compileSdk 36/g" {} +
         find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk = flutter.targetSdkVersion/targetSdk = 34/g' {} +
         find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk flutter.targetSdkVersion/targetSdk 34/g' {} +
         find android/app/ -name "build.gradle*" -exec sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/g' {} +
