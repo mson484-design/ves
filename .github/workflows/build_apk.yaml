@@ -27,21 +27,13 @@ jobs:
     - name: Create Android Structure
       run: flutter create . --platforms=android --org com.ves
 
-    - name: Enforce Android SDK 36
-      run: |
-        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 36/g' {} +
-        find android/app/ -name "compileSdk 34/compileSdk 36/g" {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk = flutter.targetSdkVersion/targetSdk = 34/g' {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/targetSdk flutter.targetSdkVersion/targetSdk 34/g' {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/g' {} +
-        find android/app/ -name "build.gradle*" -exec sed -i 's/minSdk flutter.minSdkVersion/minSdk 21/g' {} +
-
     - name: Get Dependencies
       run: flutter pub get
 
     - name: Build Release APK
-      run: flutter build apk --release
+      run: |
+        flutter build apk --release --dart-define=flutter.compileSdkVersion=36 --dart-define=flutter.targetSdkVersion=34 || \
+        flutter build apk --release
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
