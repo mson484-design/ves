@@ -31,9 +31,9 @@ class _VesScreenState extends State<VesScreen> {
 
   Timer? _timer;
   StreamSubscription<Position>? _posSub;
-  StreamSubscription<AccelerometerEvent>? _sensorSub;
+  StreamSubscription<UserAccelerometerEvent>? _sensorSub;
 
-  DateTime _lastAlertTime = DateTime.now().subtract(const Duration(seconds: 10));
+  DateTime _lastAlertTime = DateTime.now().subtract(const Duration(seconds: 20));
   DateTime _lastCheck = DateTime.now();
 
   @override
@@ -43,43 +43,36 @@ class _VesScreenState extends State<VesScreen> {
   }
 
   Future<void> _initAll() async {
-    // 1. 권한 요청
+    // 1. 필수 권한
     await [Permission.camera, Permission.location].request();
 
-    // 2. TTS 설정
+    // 2. TTS 음성
     try {
       await _tts.setLanguage("ko-KR");
       await _tts.setSpeechRate(0.5);
     } catch (_) {}
 
-    // 3. 카메라 탐색 및 연결
+    // 3. 후면 카메라 연결
     try {
       final cameras = await availableCameras();
       if (cameras.isNotEmpty) {
-        // 후면 카메라 우선 선택
         final backCamera = cameras.firstWhere(
           (c) => c.lensDirection == CameraLensDirection.back,
           orElse: () => cameras.first,
         );
-
         _cam = CameraController(
           backCamera,
           ResolutionPreset.high,
           enableAudio: false,
         );
-
         await _cam!.initialize();
-        if (mounted) {
-          setState(() {
-            _ready = true;
-          });
-        }
+        if (mounted) setState(() => _ready = true);
       }
     } catch (e) {
-      debugPrint("카메라 초기화 실패: $e");
+      debugPrint("카메라 오류: $e");
     }
 
-    // 4. GPS 속도 측정
+    // 4. GPS 속도
     try {
       _posSub = Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
@@ -95,15 +88,18 @@ class _VesScreenState extends State<VesScreen> {
       });
     } catch (_) {}
 
-    // 5. 충격/급감속 감지 (5초 쿨타임, 잔진동 필터링)
-    _sensorSub = accelerometerEventStream().listen((e) {
+    // 5. 중력이 제외된 '순수 충격/감속 센서' (userAccelerometer)
+    // 폰 기울기 때문에 생기는 거짓 경보 무한 반복 원천 차단
+    _sensorSub = userAccelerometerEventStream().listen((e) {
       final now = DateTime.now();
       if (now.difference(_lastCheck).inMilliseconds < 300) return;
       _lastCheck = now;
 
-      if (now.difference(_lastAlertTime).inSeconds < 5) return;
+      // 경고 울린 후 8초간은 무조건 침묵 (반복 멘트 차단)
+      if (now.difference(_lastAlertTime).inSeconds < 8) return;
 
-      if (e.x.abs() > 8.5 || e.y.abs() > 8.5 || (e.z.abs() - 9.8).abs() > 8.5) {
+      // 실제 급감속/충격 (가만히 있거나 기울여도 0에 가까움, 쿵 부딪혀야 12 이상 감지)
+      if (e.x.abs() > 12.0 || e.y.abs() > 12.0 || e.z.abs() > 12.0) {
         _lastAlertTime = now;
 
         if (!mounted) return;
@@ -115,7 +111,7 @@ class _VesScreenState extends State<VesScreen> {
         _tts.speak("주의하세요");
 
         _timer?.cancel();
-        _timer = Timer(const Duration(seconds: 3), () {
+        _timer = Timer(const Duration(seconds: 4), () {
           if (mounted) {
             setState(() {
               _status = "안전 운행 중";
@@ -144,7 +140,7 @@ class _VesScreenState extends State<VesScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 카메라 프리뷰 (화면 전체 채움)
+          // 카메라 프리뷰 (화면 전체 꽉 채움)
           if (_ready && _cam != null && _cam!.value.isInitialized)
             SizedBox.expand(
               child: FittedBox(
@@ -161,7 +157,7 @@ class _VesScreenState extends State<VesScreen> {
               child: CircularProgressIndicator(color: Colors.greenAccent),
             ),
 
-          // 상단 와이드 HUD 바
+          // 상단 와이드 직사각형 HUD
           SafeArea(
             child: Align(
               alignment: Alignment.topCenter,
