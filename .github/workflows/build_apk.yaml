@@ -27,6 +27,15 @@ jobs:
     - name: Create Android Structure
       run: flutter create . --platforms=android --org com.ves
 
+    - name: Inject Camera Permissions and SDK 36
+      run: |
+        # 카메라 및 위치 권한 강제 주입
+        sed -i '/<application/i \    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />' android/app/src/main/AndroidManifest.xml
+
+        # minSdk 21 고정 (카메라 패키지 필수 요구사항)
+        find android/app/ -name "build.gradle*" -exec sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/g' {} +
+        find android/app/ -name "build.gradle*" -exec sed -i 's/minSdk flutter.minSdkVersion/minSdk 21/g' {} +
+
     - name: Get Dependencies
       run: flutter pub get
 
