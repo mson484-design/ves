@@ -27,5 +27,8 @@ jobs:
     - name: Get Dependencies
       run: flutter pub get
 
+    - name: Create Android Scaffold
+      run: flutter create . --platforms=android --org com.ves
+
     - name: Build Release APK
       run: flutter build apk --release
