@@ -30,5 +30,10 @@ jobs:
     - name: Create Android Scaffold
       run: flutter create . --platforms=android --org com.ves
 
+    - name: Fix Compile SDK Version to 34
+      run: |
+        sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 34/g' android/app/build.gradle || true
+        sed -i 's/targetSdk flutter.targetSdkVersion/targetSdk 34/g' android/app/build.gradle || true
+
     - name: Build Release APK
       run: flutter build apk --release
