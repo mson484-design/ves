@@ -3,11 +3,12 @@ import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:path_provider/path_provider.dart';
-
+import 'package:object_detection/object_detection.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -68,20 +69,125 @@ class DetectedObject {
   });
 }
 
-/// 실제 AI 모델이 들어올 자리.
-/// 현재는 가짜 객체를 만들지 않는다.
-/// 실제 온디바이스 모델을 연결하면 이 인터페이스에 결과를 넣는다.
+/// 실제 휴대폰 카메라 영상을 휴대폰 내부 AI 모델로 분석한다.
+/// 이번 실차 테스트 범위는 사람 + 차량 두 종류다.
+/// 외부 서버, OpenAI, Cloudflare를 사용하지 않는다.
 abstract class OnDeviceVision {
   Future<List<DetectedObject>> analyze(CameraImage image);
+  Future<void> close();
 }
 
-/// 실증 초기 단계의 실제 카메라 입력 어댑터.
-/// AI 모델이 연결되기 전까지는 빈 결과만 반환한다.
-/// 즉, 화면에 보이는 풍경을 위험이라고 임의 판단하지 않는다.
 class CameraVisionAdapter implements OnDeviceVision {
+  final CameraDescription camera;
+  final CameraController controller;
+  late final ObjectDetector _detector;
+
+  Rect? _lastPersonBox;
+  Rect? _lastVehicleBox;
+  DateTime _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
+
+  CameraVisionAdapter({required this.camera, required this.controller}) {
+    _detector = ObjectDetector();
+  }
+
+  Future<void> init() async {
+    await _detector.initialize(
+      model: ObjectDetectionModel.efficientDetLite0,
+      performanceConfig: const PerformanceConfig.auto(numThreads: 2),
+    );
+  }
+
   @override
   Future<List<DetectedObject>> analyze(CameraImage image) async {
-    return const <DetectedObject>[];
+    if (!_detector.isReady) return const <DetectedObject>[];
+
+    final rotation = rotationForFrame(
+      width: image.width,
+      height: image.height,
+      sensorOrientation: camera.sensorOrientation,
+      isFrontCamera: camera.lensDirection == CameraLensDirection.front,
+      deviceOrientation: controller.value.deviceOrientation,
+    );
+
+    final detected = await _detector.detectFromCameraImage(
+      image,
+      rotation: rotation,
+      options: const ObjectDetectorOptions(
+        scoreThreshold: 0.45,
+        maxResults: 8,
+        categoryAllowlist: <String>[
+          'person',
+          'car',
+          'bus',
+          'truck',
+          'motorcycle',
+        ],
+      ),
+      maxDim: 640,
+    );
+
+    final now = DateTime.now();
+    final elapsed = now.difference(_lastFrameTime).inMilliseconds / 1000.0;
+    _lastFrameTime = now;
+    final results = <DetectedObject>[];
+
+    for (final item in detected) {
+      final type = _koreanType(item.categoryName);
+      if (type == null || item.score < 0.45) continue;
+
+      final previous = type == '사람' ? _lastPersonBox : _lastVehicleBox;
+      final currentArea = item.boundingBox.width * item.boundingBox.height;
+      final previousArea = previous == null
+          ? currentArea
+          : previous.width * previous.height;
+      final growth = previousArea <= 0
+          ? 0.0
+          : (currentArea - previousArea) / previousArea;
+
+      final movingToward = elapsed > 0 && growth > 0.10;
+      final relativeSpeed = movingToward
+          ? (growth * 100).clamp(0.0, 20.0)
+          : 0.0;
+
+      if (type == '사람') {
+        _lastPersonBox = item.boundingBox;
+      } else {
+        _lastVehicleBox = item.boundingBox;
+      }
+
+      final centerX = item.boundingBox.center.x / item.originalSize.width;
+      final centerY = item.boundingBox.center.y / item.originalSize.height;
+      final inDrivingPath =
+          centerX >= 0.20 && centerX <= 0.80 && centerY >= 0.20;
+
+      results.add(
+        DetectedObject(
+          type: type,
+          box: item.boundingBox,
+          relativeSpeed: relativeSpeed,
+          movingTowardVehicle: movingToward || (currentArea / (item.originalSize.width * item.originalSize.height)) >= 0.18,
+          inDrivingPath: inDrivingPath,
+          sameDirection: type == '차량',
+        ),
+      );
+    }
+
+    return results;
+  }
+
+  String? _koreanType(String label) {
+    if (label == 'person') return '사람';
+    if ({'car', 'bus', 'truck', 'motorcycle'}.contains(label)) {
+      return '차량';
+    }
+    return null;
+  }
+
+  @override
+  Future<void> close() async {
+    _lastPersonBox = null;
+    _lastVehicleBox = null;
+    await _detector.dispose();
   }
 }
 
@@ -157,7 +263,7 @@ class _VesScreenState extends State<VesScreen>
   List<CameraDescription> _cameras = const [];
 
   final VesVoice _voice = VesVoice();
-  final OnDeviceVision _vision = CameraVisionAdapter();
+  CameraVisionAdapter? _vision;
   final RiskDecisionEngine _riskEngine = RiskDecisionEngine();
 
   VehicleMode _vehicleMode = VehicleMode.bus;
@@ -172,6 +278,8 @@ class _VesScreenState extends State<VesScreen>
   bool _isRecording = false;
   bool _locationReady = false;
   bool _busStopMode = false;
+  String _aiDetected = 'AI 인식 대기';
+  List<DetectedObject> _detectedObjects = const <DetectedObject>[];
 
   Timer? _awarenessTimer;
   Timer? _analysisTimer;
@@ -230,7 +338,7 @@ class _VesScreenState extends State<VesScreen>
         ResolutionPreset.medium,
         enableAudio: false,
         imageFormatGroup: Platform.isAndroid
-            ? ImageFormatGroup.yuv420
+            ? ImageFormatGroup.nv21
             : ImageFormatGroup.bgra8888,
       );
 
@@ -242,6 +350,8 @@ class _VesScreenState extends State<VesScreen>
       }
 
       _camera = controller;
+      await _vision?.close();
+      _vision = CameraVisionAdapter(camera: selected, controller: controller);
 
       setState(() {
         _ready = true;
@@ -311,42 +421,41 @@ class _VesScreenState extends State<VesScreen>
 
   void _startImageAnalysis() {
     _analysisTimer?.cancel();
-
-    // 실제 카메라 프레임을 받는다.
-    // 가짜 객체를 생성하지 않는다.
     _analysisTimer = Timer.periodic(
-      const Duration(milliseconds: 250),
-      (_) => _analyzeCurrentCamera(),
+      const Duration(milliseconds: 350),
+      (_) {
+        if (!_ready || _camera == null || _camera!.value.isStreamingImages) return;
+        _openVisionStream();
+      },
     );
   }
 
-  Future<void> _analyzeCurrentCamera() async {
-    if (!_ready ||
-        _camera == null ||
-        !_camera!.value.isInitialized ||
-        _isAnalyzing) {
-      return;
-    }
-
-    if (_camera!.value.isStreamingImages) return;
-
-    _isAnalyzing = true;
+  Future<void> _openVisionStream() async {
+    final camera = _camera;
+    if (camera == null || !camera.value.isInitialized || camera.value.isStreamingImages) return;
 
     try {
-      await _camera!.startImageStream((CameraImage image) async {
-        if (!_isAnalyzing) return;
-
-        _isAnalyzing = false;
+      await camera.startImageStream((CameraImage image) async {
+        if (_isAnalyzing) return;
+        _isAnalyzing = true;
 
         try {
-          final objects = await _vision.analyze(image);
+          final objects = await _vision?.analyze(image) ?? const <DetectedObject>[];
+
+          if (mounted) {
+            setState(() {
+              _detectedObjects = objects;
+              _aiDetected = objects.isEmpty
+                  ? 'AI: 사람·차량 탐색 중'
+                  : 'AI 감지: ${objects.map((e) => e.type).toSet().join(' · ')}';
+            });
+          }
 
           for (final object in objects) {
             final level = _riskEngine.evaluate(
               object: object,
               vehicleSpeed: _speed,
             );
-
             if (level.index > _riskLevel.index) {
               _applyRisk(level, object.type);
             }
@@ -354,11 +463,7 @@ class _VesScreenState extends State<VesScreen>
         } catch (e) {
           debugPrint('Vision analysis error: $e');
         } finally {
-          if (_camera?.value.isStreamingImages == true) {
-            try {
-              await _camera?.stopImageStream();
-            } catch (_) {}
-          }
+          _isAnalyzing = false;
         }
       });
     } catch (e) {
@@ -510,6 +615,16 @@ class _VesScreenState extends State<VesScreen>
     return dir;
   }
 
+  Future<void> _exitVes() async {
+    await _stopCameraSafely();
+    await _positionSubscription?.cancel();
+    _positionSubscription = null;
+    await _voice.stop();
+    if (mounted) {
+      await SystemNavigator.pop();
+    }
+  }
+
   void _setBusStopMode(bool value) {
     setState(() {
       _busStopMode = value;
@@ -626,9 +741,11 @@ class _VesScreenState extends State<VesScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
+      _analysisTimer?.cancel();
       _stopCameraSafely();
     } else if (state == AppLifecycleState.resumed) {
       _initializeCamera();
+      _startImageAnalysis();
     }
   }
 
@@ -644,6 +761,8 @@ class _VesScreenState extends State<VesScreen>
       }
 
       await _camera?.dispose();
+      await _vision?.close();
+      _vision = null;
     } catch (_) {}
 
     _camera = null;
@@ -665,6 +784,7 @@ class _VesScreenState extends State<VesScreen>
     _positionSubscription?.cancel();
 
     _camera?.dispose();
+    _vision?.close();
     _voice.dispose();
 
     super.dispose();
@@ -685,6 +805,16 @@ class _VesScreenState extends State<VesScreen>
             const Center(
               child: CircularProgressIndicator(
                 color: Colors.greenAccent,
+              ),
+            ),
+
+          if (_ready && _detectedObjects.isNotEmpty)
+            IgnorePointer(
+              child: CustomPaint(
+                painter: _DetectionPainter(
+                  objects: _detectedObjects,
+                  imageSize: _camera!.value.previewSize ?? const Size(1, 1),
+                ),
               ),
             ),
 
@@ -791,6 +921,15 @@ class _VesScreenState extends State<VesScreen>
                                 fontSize: 12,
                               ),
                             ),
+                            const SizedBox(height: 5),
+                            Text(
+                              _aiDetected,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
                           ],
                         ),
                       ),
@@ -819,6 +958,12 @@ class _VesScreenState extends State<VesScreen>
                           ),
                         ),
                       ),
+                      const SizedBox(width: 10),
+                      ElevatedButton.icon(
+                        onPressed: _exitVes,
+                        icon: const Icon(Icons.close),
+                        label: const Text('종료'),
+                      ),
                     ],
                   ),
                 ),
@@ -829,6 +974,7 @@ class _VesScreenState extends State<VesScreen>
       ),
     );
   }
+
 
   Widget _topButton({
     required IconData icon,
@@ -847,3 +993,63 @@ class _VesScreenState extends State<VesScreen>
     );
   }
 }
+
+class _DetectionPainter extends CustomPainter {
+  final List<DetectedObject> objects;
+  final Size imageSize;
+
+  const _DetectionPainter({
+    required this.objects,
+    required this.imageSize,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (imageSize.width <= 0 || imageSize.height <= 0) return;
+
+    final scaleX = size.width / imageSize.height;
+    final scaleY = size.height / imageSize.width;
+
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3;
+
+    for (final object in objects) {
+      paint.color = object.type == '사람' ? Colors.amberAccent : Colors.lightBlueAccent;
+      final b = object.box;
+      final rect = Rect.fromLTRB(
+        b.left * scaleX,
+        b.top * scaleY,
+        b.right * scaleX,
+        b.bottom * scaleY,
+      );
+      canvas.drawRect(rect, paint);
+
+      final labelPaint = Paint()..color = paint.color.withOpacity(0.9);
+      final labelRect = Rect.fromLTWH(
+        rect.left,
+        rect.top,
+        rect.width.clamp(70.0, 130.0),
+        26,
+      );
+      canvas.drawRect(labelRect, labelPaint);
+      final textPainter = TextPainter(
+        text: TextSpan(
+          text: object.type,
+          style: const TextStyle(
+            color: Colors.black,
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: labelRect.width - 8);
+      textPainter.paint(canvas, labelRect.topLeft + const Offset(4, 4));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DetectionPainter oldDelegate) => true;
+}
+
+
