@@ -58,6 +58,8 @@ class DetectedObject {
   final bool movingTowardVehicle;
   final bool inDrivingPath;
   final bool sameDirection;
+  final bool pathConflict;
+  final double pathOverlap;
 
   const DetectedObject({
     required this.type,
@@ -66,6 +68,8 @@ class DetectedObject {
     required this.movingTowardVehicle,
     required this.inDrivingPath,
     required this.sameDirection,
+    required this.pathConflict,
+    required this.pathOverlap,
   });
 }
 
@@ -85,6 +89,7 @@ class CameraVisionAdapter implements OnDeviceVision {
   Rect? _lastPersonBox;
   Rect? _lastVehicleBox;
   DateTime _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _initialized = false;
 
   CameraVisionAdapter({required this.camera, required this.controller}) {
     _detector = ObjectDetector();
@@ -95,11 +100,65 @@ class CameraVisionAdapter implements OnDeviceVision {
       model: ObjectDetectionModel.efficientDetLite0,
       performanceConfig: const PerformanceConfig.auto(numThreads: 2),
     );
+    _initialized = _detector.isReady;
+  }
+
+  Rect _toRect(BoundingBox box) {
+    return Rect.fromLTRB(
+      box.left,
+      box.top,
+      box.right,
+      box.bottom,
+    );
+  }
+
+  /// 2단계: 화면 전체를 위험구역으로 보지 않고
+  /// 원근을 고려한 '자차 진행 통로'와 객체의 실제 위치 관계를 계산한다.
+  ///
+  /// 주의: 이것은 현재 휴대폰 카메라 MVP의 실증용 경로 필터다.
+  /// 차선 검출/HD맵/GPS 차로정보가 아니므로 실제 차선 판정으로 간주하지 않는다.
+  bool _isPathConflict(Rect box, Size imageSize) {
+    if (imageSize.width <= 0 || imageSize.height <= 0) return false;
+
+    final centerX = box.center.dx / imageSize.width;
+    final bottomY = box.bottom / imageSize.height;
+
+    // 화면 위쪽의 작은 물체는 아직 충돌 경로 판단에서 제외한다.
+    if (bottomY < 0.35) return false;
+
+    // 화면 아래로 갈수록 자차 진행 통로가 넓어지는 원근형 통로.
+    final t = ((bottomY - 0.35) / 0.65).clamp(0.0, 1.0);
+    final halfWidth = 0.14 + (0.28 * t);
+
+    // 우측통행 차량의 전방 카메라를 기준으로 한 MVP 중심값.
+    // 실제 버스 장착 위치에 따라 실증 후 조정한다.
+    const pathCenterX = 0.55;
+
+    return (centerX - pathCenterX).abs() <= halfWidth;
+  }
+
+  bool _hasStablePrevious(Rect? previous, Rect current) {
+    if (previous == null) return false;
+
+    final intersection = previous.intersect(current);
+    if (intersection.width <= 0 || intersection.height <= 0) return false;
+
+    final intersectionArea = intersection.width * intersection.height;
+    final previousArea = previous.width * previous.height;
+    final currentArea = current.width * current.height;
+    final unionArea = previousArea + currentArea - intersectionArea;
+
+    if (unionArea <= 0) return false;
+
+    // 같은 물체로 볼 수 있는 최소 IoU.
+    return (intersectionArea / unionArea) >= 0.15;
   }
 
   @override
   Future<List<DetectedObject>> analyze(CameraImage image) async {
-    if (!_detector.isReady) return const <DetectedObject>[];
+    if (!_initialized || !_detector.isReady) {
+      return const <DetectedObject>[];
+    }
 
     final rotation = rotationForFrame(
       width: image.width,
@@ -135,39 +194,55 @@ class CameraVisionAdapter implements OnDeviceVision {
       final type = _koreanType(item.categoryName);
       if (type == null || item.score < 0.45) continue;
 
+      final box = _toRect(item.boundingBox);
       final previous = type == '사람' ? _lastPersonBox : _lastVehicleBox;
-      final currentArea = item.boundingBox.width * item.boundingBox.height;
-      final previousArea = previous == null
-          ? currentArea
-          : previous.width * previous.height;
+
+      final currentArea = box.width * box.height;
+      final previousIsSameObject = _hasStablePrevious(previous, box);
+      final previousArea = previousIsSameObject && previous != null
+          ? previous.width * previous.height
+          : currentArea;
+
       final growth = previousArea <= 0
           ? 0.0
           : (currentArea - previousArea) / previousArea;
 
-      final movingToward = elapsed > 0 && growth > 0.10;
+      // 단순히 새로 나타난 물체를 접근 물체로 판단하지 않는다.
+      final movingToward =
+          elapsed > 0 && previousIsSameObject && growth > 0.10;
+
       final relativeSpeed = movingToward
           ? (growth * 100).clamp(0.0, 20.0)
           : 0.0;
 
       if (type == '사람') {
-        _lastPersonBox = item.boundingBox;
+        _lastPersonBox = box;
       } else {
-        _lastVehicleBox = item.boundingBox;
+        _lastVehicleBox = box;
       }
 
-      final centerX = item.boundingBox.center.x / item.originalSize.width;
-      final centerY = item.boundingBox.center.y / item.originalSize.height;
-      final inDrivingPath =
-          centerX >= 0.20 && centerX <= 0.80 && centerY >= 0.20;
+      final pathConflict = _isPathConflict(
+        box,
+        item.originalSize,
+      );
+
+      final normalizedArea =
+          currentArea / (item.originalSize.width * item.originalSize.height);
+
+      // 객체가 자차 진행 통로와 실제로 겹칠 때만 2단계 위험판단 대상으로 보낸다.
+      final inDrivingPath = pathConflict;
 
       results.add(
         DetectedObject(
           type: type,
-          box: item.boundingBox,
+          box: box,
           relativeSpeed: relativeSpeed,
-          movingTowardVehicle: movingToward || (currentArea / (item.originalSize.width * item.originalSize.height)) >= 0.18,
+          movingTowardVehicle: movingToward || normalizedArea >= 0.18,
           inDrivingPath: inDrivingPath,
-          sameDirection: type == '차량',
+          // 단안 카메라만으로 진행방향을 확정하지 않는다.
+          sameDirection: false,
+          pathConflict: pathConflict,
+          pathOverlap: pathConflict ? 1.0 : 0.0,
         ),
       );
     }
@@ -187,6 +262,7 @@ class CameraVisionAdapter implements OnDeviceVision {
   Future<void> close() async {
     _lastPersonBox = null;
     _lastVehicleBox = null;
+    _initialized = false;
     await _detector.dispose();
   }
 }
@@ -196,12 +272,22 @@ class RiskDecisionEngine {
     required DetectedObject object,
     required double vehicleSpeed,
   }) {
-    if (!object.inDrivingPath || !object.movingTowardVehicle) {
+    // 정차 중에는 주행 충돌 음성경고를 하지 않는다.
+    if (vehicleSpeed < 1.0) return RiskLevel.normal;
+
+    // 2단계 핵심: 자차 진행 통로 밖의 객체는 경고 대상에서 제외한다.
+    // 따라서 정상적인 반대 차로/도로 가장자리 객체가 화면에 보이는 것만으로는
+    // 위험 경고를 발생시키지 않는다.
+    if (!object.pathConflict || !object.inDrivingPath) {
       return RiskLevel.normal;
     }
 
-    // 실제 상용 기준값이 아니라 AI 모델 출력값을 연결하기 위한 구조.
-    // 실제 모델/실증 데이터로 검증 후 조정해야 한다.
+    if (!object.movingTowardVehicle) {
+      return RiskLevel.normal;
+    }
+
+    // 현재는 실제 거리(m)를 측정하지 않는다.
+    // 상대 접근량을 이용한 MVP 단계값이며 실증 데이터로 검증해야 한다.
     final v = object.relativeSpeed.abs();
 
     if (v >= 15) return RiskLevel.emergency;
@@ -338,7 +424,7 @@ class _VesScreenState extends State<VesScreen>
         ResolutionPreset.medium,
         enableAudio: false,
         imageFormatGroup: Platform.isAndroid
-            ? ImageFormatGroup.nv21
+            ? ImageFormatGroup.yuv420
             : ImageFormatGroup.bgra8888,
       );
 
@@ -351,12 +437,14 @@ class _VesScreenState extends State<VesScreen>
 
       _camera = controller;
       await _vision?.close();
-      _vision = CameraVisionAdapter(camera: selected, controller: controller);
+      final vision = CameraVisionAdapter(camera: selected, controller: controller);
+      await vision.init();
+      _vision = vision;
 
       setState(() {
         _ready = true;
         _status = 'VES 작동 중';
-        _subStatus = '전방 카메라 실증 준비 완료';
+        _subStatus = '2단계 자차 진행경로 필터 실증 준비 완료';
       });
 
       _startImageAnalysis();
@@ -556,7 +644,6 @@ class _VesScreenState extends State<VesScreen>
 
   Future<void> _toggleRecording() async {
     final camera = _camera;
-
     if (camera == null || !camera.value.isInitialized) return;
 
     try {
@@ -571,6 +658,11 @@ class _VesScreenState extends State<VesScreen>
           });
         }
 
+        // 카메라 영상 분석을 다시 시작한다.
+        if (_ready && !camera.value.isStreamingImages) {
+          await _openVisionStream();
+        }
+
         await _voice.speak(
           '실증 영상 저장이 완료되었습니다.',
           minimumInterval: const Duration(seconds: 10),
@@ -578,21 +670,31 @@ class _VesScreenState extends State<VesScreen>
         return;
       }
 
-      final directory = await _getRecordingDirectory();
+      // 현재 카메라 영상 분석 스트림과 일반 동영상 녹화는
+      // 이 camera 플러그인 버전에서 동시에 사용할 수 없다.
+      if (camera.value.isStreamingImages) {
+        await camera.stopImageStream();
+      }
 
-      // camera 플러그인이 실제 파일을 관리하도록 하고,
-      // 앱 종료 전까지 저장 경로를 기록한다.
+      final directory = await _getRecordingDirectory();
       await camera.startVideoRecording();
 
       if (mounted) {
         setState(() {
           _isRecording = true;
           _status = 'VES 실증 촬영 중';
-          _subStatus = directory.path;
+          _subStatus = '임시 영상: ${directory.path}';
         });
       }
     } catch (e) {
       debugPrint('Recording error: $e');
+
+      // 녹화 시작 실패 후에도 분석 스트림을 복구한다.
+      if (mounted && _ready && camera.value.isInitialized &&
+          !camera.value.isRecordingVideo &&
+          !camera.value.isStreamingImages) {
+        await _openVisionStream();
+      }
 
       if (mounted) {
         setState(() {
@@ -1051,5 +1153,4 @@ class _DetectionPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _DetectionPainter oldDelegate) => true;
 }
-
 
