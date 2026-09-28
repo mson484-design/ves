@@ -143,10 +143,10 @@ class CameraVisionAdapter implements OnDeviceVision {
       // object_detection의 BoundingBox를 Flutter Rect로 변환한다.
       final rawBox = item.boundingBox;
       final currentBox = Rect.fromLTRB(
-        rawBox.left.toDouble(),
-        rawBox.top.toDouble(),
-        rawBox.right.toDouble(),
-        rawBox.bottom.toDouble(),
+        rawBox.topLeft.x.toDouble(),
+        rawBox.topLeft.y.toDouble(),
+        rawBox.bottomRight.x.toDouble(),
+        rawBox.bottomRight.y.toDouble(),
       );
 
       final previous = type == '사람' ? _lastPersonBox : _lastVehicleBox;
@@ -169,8 +169,8 @@ class CameraVisionAdapter implements OnDeviceVision {
         _lastVehicleBox = currentBox;
       }
 
-      final centerX = currentBox.center.x / item.originalSize.width;
-      final centerY = currentBox.center.y / item.originalSize.height;
+      final centerX = currentBox.center.dx / item.originalSize.width;
+      final centerY = currentBox.center.dy / item.originalSize.height;
       final inDrivingPath =
           centerX >= 0.20 && centerX <= 0.80 && centerY >= 0.20;
 
@@ -299,6 +299,7 @@ class _VesScreenState extends State<VesScreen>
 
   DateTime _lastSpeedUpdate = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastRiskAlert = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastAnalysis = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
@@ -609,7 +610,7 @@ class _VesScreenState extends State<VesScreen>
         setState(() {
           _isRecording = true;
           _status = 'VES 실증 촬영 중';
-          _subStatus = directory.path;
+          _subStatus = '실증 촬영 중 · 촬영 종료 후 VES 관찰 재개';
         });
       }
     } catch (e) {
