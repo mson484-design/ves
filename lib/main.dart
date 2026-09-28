@@ -6,8 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:object_detection/object_detection.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:object_detection/object_detection.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -28,60 +28,68 @@ class VesApp extends StatelessWidget {
   }
 }
 
-enum VehicleMode { bus, commercial, smallVehicle }
-enum RiskLevel { normal, caution, danger, emergency }
+enum VehicleMode {
+  bus,
+  commercial,
+  smallVehicle,
+}
 
-enum VideoChannel { front, rear, left, right, cabin, frontBlindSpot }
+enum RiskLevel {
+  normal,
+  caution,
+  danger,
+  emergency,
+}
+
+enum VideoChannel {
+  front,
+  rear,
+  left,
+  right,
+  cabin,
+  frontBlindSpot,
+}
 
 class DetectedObject {
   final String type;
   final Rect box;
-  final double approachIndex;
-  final bool pathConflict;
-  final bool approaching;
+  final double relativeSpeed;
+  final bool movingTowardVehicle;
+  final bool inDrivingPath;
+  final bool sameDirection;
 
   const DetectedObject({
     required this.type,
     required this.box,
-    required this.approachIndex,
-    required this.pathConflict,
-    required this.approaching,
+    required this.relativeSpeed,
+    required this.movingTowardVehicle,
+    required this.inDrivingPath,
+    required this.sameDirection,
   });
 }
 
-class _TrackState {
-  final String type;
-  Rect box;
-  DateTime lastSeen;
-  double area;
-
-  _TrackState({
-    required this.type,
-    required this.box,
-    required this.lastSeen,
-    required this.area,
-  });
-}
-
+/// VES 기본코드 1차 기준본.
+/// 운전자는 운전하고, VES는 휴대폰 카메라로 계속 관찰한다.
+/// 정상은 조용히 지나가고 위험한 접근관계가 생길 때만 음성으로 개입한다.
+/// 현재 EfficientDet-Lite0는 경량 딥러닝 객체검출 단계이며,
+/// 향후 실증 데이터를 이용한 VES 전용 위험판단 모델로 교체할 수 있다.
+///
+/// 실제 휴대폰 카메라 영상을 휴대폰 내부 AI 모델로 분석한다.
+/// 이번 실차 테스트 범위는 사람 + 차량 두 종류다.
+/// 외부 서버, OpenAI, Cloudflare를 사용하지 않는다.
 abstract class OnDeviceVision {
   Future<List<DetectedObject>> analyze(CameraImage image);
   Future<void> close();
 }
 
-/// VES 기본 비전부.
-/// 핵심 원칙:
-/// 1) 주변에 보인다는 이유만으로 경고하지 않는다.
-/// 2) 정상 주행/정상 주차 객체는 무음이다.
-/// 3) 자차 진행 통로와 관계가 있고 접근 변화가 있는 객체만 위험 후보로 본다.
-/// 4) 단안 카메라의 한계를 넘어서 실제 미터 거리나 진행방향을 확정하지 않는다.
 class CameraVisionAdapter implements OnDeviceVision {
   final CameraDescription camera;
   final CameraController controller;
   late final ObjectDetector _detector;
 
-  final List<_TrackState> _tracks = <_TrackState>[];
-  DateTime _lastInference = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _initialized = false;
+  Rect? _lastPersonBox;
+  Rect? _lastVehicleBox;
+  DateTime _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   CameraVisionAdapter({required this.camera, required this.controller}) {
     _detector = ObjectDetector();
@@ -92,75 +100,11 @@ class CameraVisionAdapter implements OnDeviceVision {
       model: ObjectDetectionModel.efficientDetLite0,
       performanceConfig: const PerformanceConfig.auto(numThreads: 2),
     );
-    _initialized = _detector.isReady;
-  }
-
-  bool get canAnalyze => _initialized && _detector.isReady;
-
-  Rect _toRect(BoundingBox box) => Rect.fromLTRB(
-        box.left,
-        box.top,
-        box.right,
-        box.bottom,
-      );
-
-  double _iou(Rect a, Rect b) {
-    final left = a.left > b.left ? a.left : b.left;
-    final top = a.top > b.top ? a.top : b.top;
-    final right = a.right < b.right ? a.right : b.right;
-    final bottom = a.bottom < b.bottom ? a.bottom : b.bottom;
-    final w = right - left;
-    final h = bottom - top;
-    if (w <= 0 || h <= 0) return 0;
-    final intersection = w * h;
-    final union = a.width * a.height + b.width * b.height - intersection;
-    return union <= 0 ? 0 : intersection / union;
-  }
-
-  _TrackState? _findTrack(String type, Rect box) {
-    _TrackState? best;
-    var bestIou = 0.0;
-    for (final track in _tracks) {
-      if (track.type != type) continue;
-      final iou = _iou(track.box, box);
-      if (iou > bestIou) {
-        bestIou = iou;
-        best = track;
-      }
-    }
-    return bestIou >= 0.12 ? best : null;
-  }
-
-  /// 실증용 '자차 진행 통로' 필터.
-  /// 실제 차선검출/HD Map이 아니다. 화면 중앙 고정 사각형도 사용하지 않는다.
-  bool _pathConflict(Rect box, Size imageSize) {
-    if (imageSize.width <= 0 || imageSize.height <= 0) return false;
-
-    final centerX = box.center.dx / imageSize.width;
-    final bottomY = box.bottom / imageSize.height;
-
-    // 화면 위쪽의 먼 작은 객체는 충돌 후보에서 제외한다.
-    if (bottomY < 0.34) return false;
-
-    // 아래쪽으로 갈수록 자차 진행영역이 넓어지는 단순 원근형 통로.
-    final t = ((bottomY - 0.34) / 0.66).clamp(0.0, 1.0);
-    final halfWidth = 0.12 + (0.23 * t);
-    const pathCenter = 0.50;
-
-    return (centerX - pathCenter).abs() <= halfWidth;
   }
 
   @override
   Future<List<DetectedObject>> analyze(CameraImage image) async {
-    if (!canAnalyze) return const <DetectedObject>[];
-
-    // 매 카메라 프레임마다 AI를 돌리지 않는다.
-    // 0.55초 간격의 실증용 저부하 관찰이다.
-    final now = DateTime.now();
-    if (now.difference(_lastInference).inMilliseconds < 550) {
-      return const <DetectedObject>[];
-    }
-    _lastInference = now;
+    if (!_detector.isReady) return const <DetectedObject>[];
 
     final rotation = rotationForFrame(
       width: image.width,
@@ -174,8 +118,8 @@ class CameraVisionAdapter implements OnDeviceVision {
       image,
       rotation: rotation,
       options: const ObjectDetectorOptions(
-        scoreThreshold: 0.50,
-        maxResults: 6,
+        scoreThreshold: 0.45,
+        maxResults: 8,
         categoryAllowlist: <String>[
           'person',
           'car',
@@ -184,60 +128,63 @@ class CameraVisionAdapter implements OnDeviceVision {
           'motorcycle',
         ],
       ),
-      maxDim: 480,
+      maxDim: 640,
     );
 
+    final now = DateTime.now();
+    final elapsed = now.difference(_lastFrameTime).inMilliseconds / 1000.0;
+    _lastFrameTime = now;
     final results = <DetectedObject>[];
 
     for (final item in detected) {
       final type = _koreanType(item.categoryName);
-      if (type == null || item.score < 0.50) continue;
+      if (type == null || item.score < 0.45) continue;
 
-      final box = _toRect(item.boundingBox);
-      final area = box.width * box.height;
-      final track = _findTrack(type, box);
+      // object_detection의 BoundingBox를 Flutter Rect로 변환한다.
+      final rawBox = item.boundingBox;
+      final currentBox = Rect.fromLTRB(
+        rawBox.left.toDouble(),
+        rawBox.top.toDouble(),
+        rawBox.right.toDouble(),
+        rawBox.bottom.toDouble(),
+      );
 
-      var approaching = false;
-      var approachIndex = 0.0;
+      final previous = type == '사람' ? _lastPersonBox : _lastVehicleBox;
+      final currentArea = currentBox.width.abs() * currentBox.height.abs();
+      final previousArea = previous == null
+          ? currentArea
+          : previous.width.abs() * previous.height.abs();
+      final growth = previousArea <= 0
+          ? 0.0
+          : (currentArea - previousArea) / previousArea;
 
-      if (track != null) {
-        final seconds = now.difference(track.lastSeen).inMilliseconds / 1000.0;
-        if (seconds > 0.05 && seconds < 2.0 && track.area > 0) {
-          final growth = (area - track.area) / track.area;
-          // 새로 나타난 객체가 아니라 같은 객체가 가까워지는 변화만 인정한다.
-          approaching = growth > 0.08;
-          approachIndex = (growth * 100).clamp(0.0, 20.0);
-        }
-        track.box = box;
-        track.area = area;
-        track.lastSeen = now;
+      final movingToward = elapsed > 0 && growth > 0.10;
+      final relativeSpeed = movingToward
+          ? (growth * 100).clamp(0.0, 20.0)
+          : 0.0;
+
+      if (type == '사람') {
+        _lastPersonBox = currentBox;
       } else {
-        final newTrack = _TrackState(
-          type: type,
-          box: box,
-          lastSeen: now,
-          area: area,
-        );
-        _tracks.add(newTrack);
+        _lastVehicleBox = currentBox;
       }
 
-      final pathConflict = _pathConflict(box, item.originalSize);
+      final centerX = currentBox.center.x / item.originalSize.width;
+      final centerY = currentBox.center.y / item.originalSize.height;
+      final inDrivingPath =
+          centerX >= 0.20 && centerX <= 0.80 && centerY >= 0.20;
 
-      // 단순히 크기가 크다는 이유로 접근 차량으로 만들지 않는다.
       results.add(
         DetectedObject(
           type: type,
-          box: box,
-          approachIndex: approachIndex,
-          pathConflict: pathConflict,
-          approaching: approaching,
+          box: currentBox,
+          relativeSpeed: relativeSpeed,
+          movingTowardVehicle: movingToward,
+          inDrivingPath: inDrivingPath,
+          sameDirection: false,
         ),
       );
     }
-
-    _tracks.removeWhere(
-      (track) => now.difference(track.lastSeen).inSeconds > 2,
-    );
 
     return results;
   }
@@ -252,8 +199,8 @@ class CameraVisionAdapter implements OnDeviceVision {
 
   @override
   Future<void> close() async {
-    _tracks.clear();
-    _initialized = false;
+    _lastPersonBox = null;
+    _lastVehicleBox = null;
     await _detector.dispose();
   }
 }
@@ -263,26 +210,17 @@ class RiskDecisionEngine {
     required DetectedObject object,
     required double vehicleSpeed,
   }) {
-    // 정차/저속 상태에서는 현재 기본 버전에서 주행 충돌 경고를 하지 않는다.
-    if (vehicleSpeed < 3.0) return RiskLevel.normal;
+    // 현재는 단안 카메라의 '상대적 접근 변화'만 사용한다.
+    // 실제 거리(m)나 TTC를 가짜로 만들지 않는다.
+    if (!object.inDrivingPath || !object.movingTowardVehicle) {
+      return RiskLevel.normal;
+    }
 
-    // 주변에 있다는 사실만으로는 위험이 아니다.
-    if (!object.pathConflict) return RiskLevel.normal;
+    final approach = object.relativeSpeed.abs();
 
-    // 정상적으로 정지/주행하는 객체는 무음이다.
-    if (!object.approaching) return RiskLevel.normal;
-
-    // 실제 m/s나 미터 단위가 아니다. 화면상 접근 변화의 실증용 지수다.
-    final approach = object.approachIndex;
-
-    // 차량 속도가 높을수록 작은 접근 변화에도 주의를 더 일찍 검토한다.
-    final cautionThreshold = vehicleSpeed >= 50 ? 1.5 : 2.0;
-    final dangerThreshold = vehicleSpeed >= 70 ? 4.0 : 6.0;
-    final emergencyThreshold = vehicleSpeed >= 90 ? 8.0 : 12.0;
-
-    if (approach >= emergencyThreshold) return RiskLevel.emergency;
-    if (approach >= dangerThreshold) return RiskLevel.danger;
-    if (approach >= cautionThreshold) return RiskLevel.caution;
+    if (approach >= 0.45) return RiskLevel.emergency;
+    if (approach >= 0.25) return RiskLevel.danger;
+    if (approach >= 0.10) return RiskLevel.caution;
     return RiskLevel.normal;
   }
 }
@@ -306,7 +244,9 @@ class VesVoice {
   }) async {
     final now = DateTime.now();
     if (now.difference(_lastSpeak) < minimumInterval) return;
+
     _lastSpeak = now;
+
     try {
       await _tts.stop();
       await _tts.speak(text);
@@ -319,7 +259,9 @@ class VesVoice {
     } catch (_) {}
   }
 
-  Future<void> dispose() async => stop();
+  Future<void> dispose() async {
+    await stop();
+  }
 }
 
 class VesScreen extends StatefulWidget {
@@ -329,26 +271,30 @@ class VesScreen extends StatefulWidget {
   State<VesScreen> createState() => _VesScreenState();
 }
 
-class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
+class _VesScreenState extends State<VesScreen>
+    with WidgetsBindingObserver {
   CameraController? _camera;
   List<CameraDescription> _cameras = const [];
 
   final VesVoice _voice = VesVoice();
-  final RiskDecisionEngine _riskEngine = RiskDecisionEngine();
   CameraVisionAdapter? _vision;
+  final RiskDecisionEngine _riskEngine = RiskDecisionEngine();
 
   VehicleMode _vehicleMode = VehicleMode.bus;
   RiskLevel _riskLevel = RiskLevel.normal;
 
   double _speed = 0.0;
-  String _status = 'VES 준비 중';
-  String _subStatus = '운전자는 운전, VES는 위험 감시';
+  String _status = 'VES 안전보조 대기';
+  String _subStatus = '운전자는 운전하고 VES는 관찰합니다.';
 
   bool _ready = false;
   bool _isAnalyzing = false;
+  bool _isRecording = false;
+  bool _locationReady = false;
   bool _busStopMode = false;
 
   Timer? _awarenessTimer;
+
   StreamSubscription<Position>? _positionSubscription;
 
   DateTime _lastSpeedUpdate = DateTime.fromMillisecondsSinceEpoch(0);
@@ -372,6 +318,7 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
   Future<void> _requestPermissions() async {
     await [
       Permission.camera,
+      Permission.microphone,
       Permission.location,
     ].request();
   }
@@ -379,10 +326,12 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
   Future<void> _initializeCamera() async {
     try {
       _cameras = await availableCameras();
+
       if (_cameras.isEmpty) {
         if (mounted) {
           setState(() {
             _status = '카메라를 찾을 수 없습니다';
+            _subStatus = '카메라 연결을 확인하세요';
           });
         }
         return;
@@ -394,43 +343,40 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
       );
 
       await _camera?.dispose();
-      await _vision?.close();
 
       final controller = CameraController(
         selected,
         ResolutionPreset.medium,
         enableAudio: false,
         imageFormatGroup: Platform.isAndroid
-            ? ImageFormatGroup.yuv420
+            ? ImageFormatGroup.nv21
             : ImageFormatGroup.bgra8888,
       );
 
       await controller.initialize();
 
-      final vision = CameraVisionAdapter(
-        camera: selected,
-        controller: controller,
-      );
-      await vision.init();
-
       if (!mounted) {
-        await vision.close();
         await controller.dispose();
         return;
       }
 
       _camera = controller;
-      _vision = vision;
+      await _vision?.close();
+      _vision = CameraVisionAdapter(camera: selected, controller: controller);
+
+      // 중요: 객체검출 딥러닝 모델을 실제로 초기화한다.
+      await _vision!.init();
 
       setState(() {
         _ready = true;
-        _status = vision.canAnalyze ? 'VES 작동 중' : '카메라 작동 / AI 준비 필요';
-        _subStatus = '운전자는 운전, VES는 위험 감시';
+        _status = 'VES 작동 중';
+        _subStatus = '전방 카메라 실증 준비 완료';
       });
 
       _startImageAnalysis();
     } catch (e) {
       debugPrint('Camera initialization error: $e');
+
       if (mounted) {
         setState(() {
           _status = '카메라 초기화 오류';
@@ -445,22 +391,31 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
       if (!await Geolocator.isLocationServiceEnabled()) return;
 
       var permission = await Geolocator.checkPermission();
+
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
       }
+
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
         return;
       }
 
-      _positionSubscription = Geolocator.getPositionStream(
+      _locationReady = true;
+
+      _positionSubscription =
+          Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.high,
           distanceFilter: 1,
         ),
       ).listen((position) {
         final now = DateTime.now();
-        if (now.difference(_lastSpeedUpdate).inMilliseconds < 500) return;
+
+        if (now.difference(_lastSpeedUpdate).inMilliseconds < 500) {
+          return;
+        }
+
         _lastSpeedUpdate = now;
 
         final speed = position.speed.isFinite && position.speed > 0
@@ -468,7 +423,9 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
             : 0.0;
 
         if (mounted) {
-          setState(() => _speed = speed);
+          setState(() {
+            _speed = speed;
+          });
         }
       });
     } catch (e) {
@@ -477,26 +434,49 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _startImageAnalysis() async {
+    await _openVisionStream();
+  }
+
+  Future<void> _openVisionStream() async {
     final camera = _camera;
-    if (camera == null || !camera.value.isInitialized) return;
-    if (camera.value.isStreamingImages) return;
+    if (camera == null ||
+        !camera.value.isInitialized ||
+        camera.value.isStreamingImages) {
+      return;
+    }
 
     try {
       await camera.startImageStream((CameraImage image) async {
-        if (_isAnalyzing) return;
+        if (_isAnalyzing || _vision == null) return;
+
+        final now = DateTime.now();
+        // 모든 프레임을 깊게 분석하지 않아 휴대폰 부하를 낮춘다.
+        if (now.difference(_lastAnalysis).inMilliseconds < 550) return;
+        _lastAnalysis = now;
         _isAnalyzing = true;
 
         try {
-          final objects = await _vision?.analyze(image) ?? const <DetectedObject>[];
+          final objects = await _vision!.analyze(image);
+
+          RiskLevel strongest = RiskLevel.normal;
+          String strongestType = '위험대상';
 
           for (final object in objects) {
-            final level = _riskEngine.evaluate(
-              object: object,
-              vehicleSpeed: _speed,
-            );
-            if (level.index > _riskLevel.index) {
-              _applyRisk(level, object.type);
+            final level = _riskEngine.evaluate(object: object, vehicleSpeed: _speed);
+            if (level.index > strongest.index) {
+              strongest = level;
+              strongestType = object.type;
             }
+          }
+
+          if (strongest != RiskLevel.normal &&
+              strongest.index >= _riskLevel.index) {
+            _applyRisk(strongest, strongestType);
+          } else if (mounted && _riskLevel == RiskLevel.normal) {
+            setState(() {
+              _status = 'VES 작동 중';
+              _subStatus = '정상 상황을 조용히 관찰 중';
+            });
           }
         } catch (e) {
           debugPrint('Vision analysis error: $e');
@@ -514,19 +494,24 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
     if (!mounted) return;
 
     final now = DateTime.now();
-    if (now.difference(_lastRiskAlert).inSeconds < 4) return;
+
+    if (now.difference(_lastRiskAlert).inSeconds < 4) {
+      return;
+    }
+
     _lastRiskAlert = now;
 
     setState(() {
       _riskLevel = level;
+
       switch (level) {
         case RiskLevel.caution:
-          _status = '주의: 위험 접근';
-          _subStatus = '$objectType의 접근관계를 확인하세요';
+          _status = '주의: 위험 접근 감지';
+          _subStatus = '$objectType 접근 관계 확인';
           break;
         case RiskLevel.danger:
-          _status = '위험: 충돌 가능 접근';
-          _subStatus = '$objectType 접근 변화';
+          _status = '위험: 위험 접근';
+          _subStatus = '$objectType 충돌 가능성 증가';
           break;
         case RiskLevel.emergency:
           _status = '긴급: 충돌 위험';
@@ -541,7 +526,7 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
 
     switch (level) {
       case RiskLevel.caution:
-        _voice.speak('주의하세요. 차량 접근입니다.');
+        _voice.speak('주의하세요. 접근 중입니다.');
         break;
       case RiskLevel.danger:
         _voice.speak('위험 접근입니다.');
@@ -558,31 +543,105 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
 
     Timer(const Duration(seconds: 4), () {
       if (!mounted) return;
+
       setState(() {
         _riskLevel = RiskLevel.normal;
         _status = 'VES 작동 중';
-        _subStatus = _busStopMode ? '정류장 확인 모드' : '정상 안전보조';
+        _subStatus = _busStopMode
+            ? '정류장 승객 확인 모드'
+            : '정상 안전보조';
       });
     });
   }
 
   void _startAwareness() {
     _awarenessTimer?.cancel();
-    _awarenessTimer = Timer.periodic(const Duration(minutes: 30), (_) {
-      if (_speed > 5) {
-        _voice.speak(
-          'VES 안전보조가 작동 중입니다.',
-          minimumInterval: const Duration(minutes: 25),
+
+    // 장시간 운전 중 운전자 각성을 위한 짧은 상태 안내.
+    // 과도한 반복 음성을 피한다.
+    _awarenessTimer = Timer.periodic(
+      const Duration(minutes: 30),
+      (_) {
+        if (_speed > 5) {
+          _voice.speak(
+            'VES 안전보조가 작동 중입니다.',
+            minimumInterval: const Duration(minutes: 25),
+          );
+        }
+      },
+    );
+  }
+
+  Future<void> _toggleRecording() async {
+    final camera = _camera;
+
+    if (camera == null || !camera.value.isInitialized) return;
+
+    try {
+      if (camera.value.isRecordingVideo) {
+        final file = await camera.stopVideoRecording();
+        _isRecording = false;
+        await _startImageAnalysis();
+
+        if (mounted) {
+          setState(() {
+            _isRecording = false;
+            _status = 'VES 작동 중';
+            _subStatus = '영상 저장 완료: ${file.path}';
+          });
+        }
+
+        await _voice.speak(
+          '실증 영상 저장이 완료되었습니다.',
+          minimumInterval: const Duration(seconds: 10),
         );
+        return;
       }
-    });
+
+      // 카메라 스트림과 동영상 녹화를 동시에 사용하지 않는다.
+      if (camera.value.isStreamingImages) {
+        await camera.stopImageStream();
+      }
+
+      await camera.startVideoRecording();
+
+      if (mounted) {
+        setState(() {
+          _isRecording = true;
+          _status = 'VES 실증 촬영 중';
+          _subStatus = directory.path;
+        });
+      }
+    } catch (e) {
+      debugPrint('Recording error: $e');
+
+      if (mounted) {
+        setState(() {
+          _isRecording = false;
+          _status = '촬영 오류';
+          _subStatus = e.toString();
+        });
+      }
+    }
+  }
+
+  Future<void> _exitVes() async {
+    await _stopCameraSafely();
+    await _positionSubscription?.cancel();
+    _positionSubscription = null;
+    await _voice.stop();
+    if (mounted) {
+      await SystemNavigator.pop();
+    }
   }
 
   void _setBusStopMode(bool value) {
     setState(() {
       _busStopMode = value;
-      _status = value ? '정류장 확인 모드' : 'VES 작동 중';
-      _subStatus = value ? '승객 확인 보조' : '정상 안전보조';
+      _status = value ? '정류장 승객 확인 모드' : 'VES 작동 중';
+      _subStatus = value
+          ? '실제 정류장 상황을 카메라로 확인'
+          : '정상 안전보조';
     });
 
     if (value) {
@@ -597,19 +656,30 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
     final selected = await showModalBottomSheet<VehicleMode>(
       context: context,
       backgroundColor: Colors.black87,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _modeTile(VehicleMode.bus, 'VES-BUS', '버스 / 승객안전'),
-            _modeTile(VehicleMode.commercial, 'VES-COMMERCIAL', '상용차'),
-            _modeTile(VehicleMode.smallVehicle, 'VES-SMALL', '승용차 / 중소형차'),
-          ],
-        ),
-      ),
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _modeTile(VehicleMode.bus, 'VES-BUS', '버스 / 승객안전'),
+              _modeTile(
+                VehicleMode.commercial,
+                'VES-COMMERCIAL',
+                '상용차',
+              ),
+              _modeTile(
+                VehicleMode.smallVehicle,
+                'VES-SMALL',
+                '중소형차 / 승용차',
+              ),
+            ],
+          ),
+        );
+      },
     );
 
     if (selected == null || !mounted) return;
+
     setState(() {
       _vehicleMode = selected;
       _status = 'VES 작동 중';
@@ -617,7 +687,11 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
     });
   }
 
-  Widget _modeTile(VehicleMode mode, String title, String subtitle) {
+  Widget _modeTile(
+    VehicleMode mode,
+    String title,
+    String subtitle,
+  ) {
     return ListTile(
       leading: const Icon(Icons.directions_car),
       title: Text(title),
@@ -629,11 +703,11 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
   String _modeDescription(VehicleMode mode) {
     switch (mode) {
       case VehicleMode.bus:
-        return '버스 전방 위험 + 승객안전 확장';
+        return '전방/후방/좌우/차내 입력 확장 + 승객안전';
       case VehicleMode.commercial:
-        return '상용차 전방/후방 확장';
+        return '전방/후방/전면 사각 입력 확장';
       case VehicleMode.smallVehicle:
-        return '승용차 전방/후방 확장';
+        return '전방/후방 블랙박스 입력 확장';
     }
   }
 
@@ -647,6 +721,18 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
         return Colors.orangeAccent;
       case RiskLevel.emergency:
         return Colors.redAccent;
+    }
+  }
+
+  IconData get _riskIcon {
+    switch (_riskLevel) {
+      case RiskLevel.normal:
+        return Icons.shield;
+      case RiskLevel.caution:
+        return Icons.warning_amber_rounded;
+      case RiskLevel.danger:
+      case RiskLevel.emergency:
+        return Icons.warning_rounded;
     }
   }
 
@@ -665,9 +751,10 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
-      _stopCameraSafely();
+        _stopCameraSafely();
     } else if (state == AppLifecycleState.resumed) {
       _initializeCamera();
+      _startImageAnalysis();
     }
   }
 
@@ -676,31 +763,38 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
       if (_camera?.value.isStreamingImages == true) {
         await _camera?.stopImageStream();
       }
+
+      if (_camera?.value.isRecordingVideo == true) {
+        // 백그라운드에서 강제로 녹화를 유지하지 않는다.
+        await _camera?.stopVideoRecording();
+      }
+
       await _camera?.dispose();
       await _vision?.close();
+      _vision = null;
     } catch (_) {}
 
     _camera = null;
-    _vision = null;
-    if (mounted) setState(() => _ready = false);
-  }
 
-  Future<void> _exitVes() async {
-    await _stopCameraSafely();
-    await _positionSubscription?.cancel();
-    _positionSubscription = null;
-    await _voice.stop();
-    if (mounted) await SystemNavigator.pop();
+    if (mounted) {
+      setState(() {
+        _ready = false;
+        _isRecording = false;
+      });
+    }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+
     _awarenessTimer?.cancel();
     _positionSubscription?.cancel();
+
     _camera?.dispose();
     _vision?.close();
     _voice.dispose();
+
     super.dispose();
   }
 
@@ -711,74 +805,154 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (_ready && _camera != null && _camera!.value.isInitialized)
+          if (_ready &&
+              _camera != null &&
+              _camera!.value.isInitialized)
             CameraPreview(_camera!)
           else
-            const Center(child: CircularProgressIndicator()),
+            const Center(
+              child: CircularProgressIndicator(
+                color: Colors.greenAccent,
+              ),
+            ),
 
-          // 의도적으로 검출 직사각형을 그리지 않는다.
-          // 운전자는 화면을 볼 필요가 없고, AI가 뒤에서 관제한다.
           SafeArea(
             child: Column(
               children: [
-                Padding(
-                  padding: const EdgeInsets.all(10),
+                Row(
+                  children: [
+                    _topButton(
+                      icon: Icons.directions_bus,
+                      text: _modeName,
+                      onTap: _switchVehicleMode,
+                    ),
+                    const Spacer(),
+                    Container(
+                      margin: const EdgeInsets.only(
+                        top: 10,
+                        right: 10,
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 7,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.7),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Row(
+                        children: [
+                          Text(
+                            _speed.toStringAsFixed(1),
+                            style: const TextStyle(
+                              fontSize: 25,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(width: 5),
+                          const Text('km/h'),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+
+                const Spacer(),
+
+                if (_vehicleMode == VehicleMode.bus)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                    ),
+                    child: Align(
+                      alignment: Alignment.centerRight,
+                      child: FloatingActionButton.small(
+                        heroTag: 'busStop',
+                        onPressed: () =>
+                            _setBusStopMode(!_busStopMode),
+                        backgroundColor:
+                            _busStopMode ? Colors.orange : Colors.black87,
+                        child: const Icon(Icons.person_pin_circle),
+                      ),
+                    ),
+                  ),
+
+                const SizedBox(height: 8),
+
+                Container(
+                  margin: const EdgeInsets.all(14),
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.82),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: _riskColor,
+                      width: 2,
+                    ),
+                  ),
                   child: Row(
                     children: [
-                      _smallPill(Icons.remove_red_eye, _modeName),
-                      const Spacer(),
-                      _smallPill(
-                        Icons.speed,
-                        '${_speed.toStringAsFixed(0)} km/h',
+                      Icon(
+                        _riskIcon,
+                        color: _riskColor,
+                        size: 30,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment:
+                              CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              _status,
+                              style: TextStyle(
+                                color: _riskColor,
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              _subStatus,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ],
                   ),
                 ),
-                const Spacer(),
-                if (_riskLevel != RiskLevel.normal)
-                  Align(
-                    alignment: Alignment.center,
-                    child: Container(
-                      margin: const EdgeInsets.only(bottom: 18),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 20,
-                        vertical: 12,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.72),
-                        borderRadius: BorderRadius.circular(30),
-                        border: Border.all(color: _riskColor, width: 2),
-                      ),
-                      child: Text(
-                        _status,
-                        style: TextStyle(
-                          color: _riskColor,
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  ),
+
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+                  padding: const EdgeInsets.only(
+                    left: 14,
+                    right: 14,
+                    bottom: 14,
+                  ),
                   child: Row(
                     children: [
                       Expanded(
-                        child: _smallButton(
-                          icon: Icons.directions_bus,
-                          text: _modeName,
-                          onTap: _switchVehicleMode,
+                        child: ElevatedButton.icon(
+                          onPressed: _toggleRecording,
+                          icon: Icon(
+                            _isRecording
+                                ? Icons.stop
+                                : Icons.fiber_manual_record,
+                          ),
+                          label: Text(
+                            _isRecording ? '촬영 중지' : '실증 촬영',
+                          ),
                         ),
                       ),
-                      const SizedBox(width: 6),
-                      if (_vehicleMode == VehicleMode.bus)
-                        _iconButton(
-                          Icons.person_pin_circle,
-                          _busStopMode,
-                          () => _setBusStopMode(!_busStopMode),
-                        ),
-                      const SizedBox(width: 6),
-                      _iconButton(Icons.close, false, _exitVes),
+                      const SizedBox(width: 10),
+                      ElevatedButton.icon(
+                        onPressed: _exitVes,
+                        icon: const Icon(Icons.close),
+                        label: const Text('종료'),
+                      ),
                     ],
                   ),
                 ),
@@ -790,50 +964,20 @@ class _VesScreenState extends State<VesScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _smallPill(IconData icon, String text) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.55),
-        borderRadius: BorderRadius.circular(18),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 15, color: Colors.white70),
-          const SizedBox(width: 5),
-          Text(text, style: const TextStyle(fontSize: 12)),
-        ],
-      ),
-    );
-  }
 
-  Widget _smallButton({
+  Widget _topButton({
     required IconData icon,
     required String text,
     required VoidCallback onTap,
   }) {
-    return ElevatedButton.icon(
-      onPressed: onTap,
-      icon: Icon(icon, size: 17),
-      label: Text(text),
-      style: ElevatedButton.styleFrom(
-        minimumSize: const Size(0, 42),
-        padding: const EdgeInsets.symmetric(horizontal: 10),
-      ),
-    );
-  }
-
-  Widget _iconButton(IconData icon, bool active, VoidCallback onTap) {
-    return SizedBox(
-      width: 48,
-      height: 42,
-      child: IconButton.filled(
-        onPressed: onTap,
-        style: IconButton.styleFrom(
-          backgroundColor: active ? Colors.orange : Colors.black.withOpacity(0.65),
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.only(left: 10, top: 10),
+        child: ElevatedButton.icon(
+          onPressed: onTap,
+          icon: Icon(icon, size: 18),
+          label: Text(text),
         ),
-        icon: Icon(icon),
       ),
     );
   }
